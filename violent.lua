@@ -232,7 +232,6 @@ local function unload()
 		entry.cvar:SetString(entry.default)
 	end
 	hook.Remove("CreateMove", "violent.aimbot")
-	hook.Remove("PostCreateMove", "violent.antiaim.verify")
 	hook.Remove("PostCreateMove", "violent.antiaim.enforce")
 	hook.Remove("EntityFireBullets", "violent.spread")
 	hook.Remove("CalcView", "violent.view")
@@ -909,46 +908,34 @@ end
 local silentView = nil
 local silentOrigin = nil
 local aaErrorNotified = false
-local antiAimStatus = { stage = "CreateMove has not run", command = -1 }
 
-addTrigger("violent_antiaim_status", "Print anti-aim runtime diagnostics", function()
-	notify("AA diagnostics v2: mode=%s, stage=%s, cmd=%d, module=%s",
-		tostring(config.Get("violent_antiaim")), antiAimStatus.stage,
-		antiAimStatus.command, tostring(ded ~= nil))
-	notify("AA expected=%s, PostCreateMove=%s", tostring(antiAimStatus.expected),
-		tostring(antiAimStatus.observed))
-end)
+-- Angle to re-assert in PostCreateMove and the command it belongs to.
+local aaEnforce, aaEnforceCommand = nil, -1
 
-hook.Add("PostCreateMove", "violent.antiaim.verify", function(cmd)
-	if cmd:CommandNumber() ~= antiAimStatus.command then return end
-	local angles = cmd:GetViewAngles()
-	antiAimStatus.observed = Angle(angles.p, angles.y, angles.r)
-end)
-
-local aaEnforce = nil
+local mYawCvar = GetConVar("m_yaw")
+local mPitchCvar = GetConVar("m_pitch")
 
 -- Runs after every Lua CreateMove hook (weapon bases, gamemodes) and right
 -- before zxcmodule rewrites the verified command CRC. Anything that overwrote
 -- our angles during the tick gets overwritten back here, so the anti-aim /
 -- silent angle is what actually reaches the server. No-op without the module.
 hook.Add("PostCreateMove", "violent.antiaim.enforce", function(cmd)
-	if aaEnforce and cmd:CommandNumber() == antiAimStatus.command then
-		local angles = cmd:GetViewAngles()
-		if angles.p ~= aaEnforce.p or angles.y ~= aaEnforce.y or angles.r ~= aaEnforce.r then
-			cmd:SetViewAngles(aaEnforce)
-		end
+	if not aaEnforce or cmd:CommandNumber() ~= aaEnforceCommand then return end
+	local angles = cmd:GetViewAngles()
+	if angles.p ~= aaEnforce.p or angles.y ~= aaEnforce.y or angles.r ~= aaEnforce.r then
+		cmd:SetViewAngles(aaEnforce)
 	end
 	aaEnforce = nil
 end)
 
+-- Accumulates raw mouse deltas into the camera angle. Must run for every
+-- CreateMove call, including the per-frame CommandNumber() == 0 samples:
+-- the engine consumes mouse deltas on those too, so skipping them drops
+-- input and makes the camera stutter at tick rate.
 local function silentUpdate(cmd)
-	local mYaw = GetConVar("m_yaw"):GetFloat()
-	local mPitch = GetConVar("m_pitch"):GetFloat()
-
-	silentView.p = math.Clamp(silentView.p + cmd:GetMouseY() * mPitch, -89, 89)
-	silentView.y = silentView.y + cmd:GetMouseX() * -mYaw
+	silentView.p = math.Clamp(silentView.p + cmd:GetMouseY() * mPitchCvar:GetFloat(), -89, 89)
+	silentView.y = math.NormalizeAngle(silentView.y - cmd:GetMouseX() * mYawCvar:GetFloat())
 	silentView.r = 0
-	silentView:Normalize()
 end
 
 function violent_aimbot(cmd)
@@ -961,104 +948,85 @@ function violent_aimbot(cmd)
 	local forward = cmd:GetViewAngles():Forward()
 	local leadTime = math.Clamp(config.GetNumber("violent_aimbot_extrapolation_ticks"), 0, 8) * engine.TickInterval()
 
-	local bestAngle, bestDot = nil, -2
+	local bestDir, bestDot = nil, -2
 
 	for _, target in ipairs(player.GetAll()) do
-		if target == ply then continue end
-		if not IsValid(target) or not target:Alive() then continue end
-		if target:IsDormant() then continue end
+		if target == ply or not IsValid(target) or not target:Alive() or target:IsDormant() then continue end
 
 		local head = aimPoint(target, ply, eyePos, leadTime)
 		if not head then continue end
 
-		local dot = forward:Dot((head - eyePos):GetNormalized())
+		local dir = head - eyePos
+		local dot = forward:Dot(dir:GetNormalized())
 		if dot > bestDot then
-			bestDot = dot
-			bestAngle = (head - eyePos):Angle()
+			bestDot, bestDir = dot, dir
 		end
 	end
 
-	if bestAngle then
-		if config.GetBool("violent_aimbot_autofire") and cmd:CommandNumber() ~= 0 then
-			aimAutoFire(cmd, ply)
-		end
+	if not bestDir then return end
 
-		bestAngle = Angle(bestAngle.p, bestAngle.y, 0)
-		local finalAngle = aimCompensate(cmd, bestAngle, ply)
-		cmd:SetViewAngles(finalAngle)
+	if config.GetBool("violent_aimbot_autofire") and cmd:CommandNumber() ~= 0 then
+		aimAutoFire(cmd, ply)
 	end
+
+	local bestAngle = bestDir:Angle()
+	bestAngle.r = 0
+	cmd:SetViewAngles(aimCompensate(cmd, bestAngle, ply))
 end
 
 function violent_movement_fix(cmd, wish_yaw)
 	local angles = cmd:GetViewAngles()
-
-	local inverted = -1
-	if math.NormalizeAngle(angles.p) > 89 or math.NormalizeAngle(angles.p) < -89 then
-		inverted = 1
-	end
+	local pitch = math.NormalizeAngle(angles.p)
+	local inverted = (pitch > 89 or pitch < -89) and 1 or -1
 
 	local diff = math.rad(math.NormalizeAngle((angles.y - wish_yaw) * inverted))
+	local cos, sin = math.cos(diff), math.sin(diff)
 
 	local forwardMove, sideMove = cmd:GetForwardMove(), cmd:GetSideMove()
-	cmd:SetForwardMove(forwardMove * -math.cos(diff) * inverted + sideMove * math.sin(diff))
-	cmd:SetSideMove(forwardMove * math.sin(diff) * inverted + sideMove * math.cos(diff))
+	cmd:SetForwardMove(forwardMove * -cos * inverted + sideMove * sin)
+	cmd:SetSideMove(forwardMove * sin * inverted + sideMove * cos)
 end
 
 hook.Add("CreateMove", "violent.aimbot", function(cmd)
-	if cmd:CommandNumber() ~= 0 then
-		antiAimStatus.command = cmd:CommandNumber()
-		antiAimStatus.stage = "syncAnimations"
-		antiAimStatus.expected, antiAimStatus.observed = nil, nil
-	end
 	syncAnimations()
 
-	if cmd:CommandNumber() == 0 then return end
+	local silent = config.GetBool("violent_aimbot_silent") or antiAimEnabled()
 
-	if config.GetBool("violent_aimbot_silent") or antiAimEnabled() then
+	-- Camera update happens before the CommandNumber() == 0 early-out on purpose (see silentUpdate).
+	if silent then
 		if not silentView then
 			local init = cmd:GetViewAngles()
 			silentView = Angle(init.p, init.y, 0)
 		end
-
 		silentUpdate(cmd)
 		cmd:SetViewAngles(Angle(silentView.p, silentView.y, 0))
 	else
-		silentView = nil
-		silentOrigin = nil
+		silentView, silentOrigin = nil, nil
 	end
 
+	if cmd:CommandNumber() == 0 then return end
+
 	-- Keep strafing before aiming so the silent movement fix is applied last.
-	if cmd:CommandNumber() ~= 0 then antiAimStatus.stage = "movement/fakelag" end
 	movement(cmd)
 	violentFakelag(cmd)
 
 	-- Camera-relative yaw before the angle pipeline touches the command.
 	local baseYaw = cmd:GetViewAngles().y
 	local ply = LocalPlayer()
-	local plyValid = IsValid(ply) and ply:Alive()
 	local aaApplied = false
 
-	-- Anti-aim first, exactly like rapehack: it is the base layer, and the
-	-- aimbot overrides it afterwards only on ticks where AA steps aside
-	-- (attack/use held). IN_ATTACK2 must never block it.
-	antiAimStatus.stage = "antiaim"
-	if not antiAimEnabled() then
-		antiAimStatus.stage = "blocked: mode must be backward or sideways"
-	elseif not plyValid then
-		antiAimStatus.stage = "blocked: local player invalid/dead"
-	elseif ply:GetMoveType() ~= MOVETYPE_WALK or ply:InVehicle() then
-		antiAimStatus.stage = "blocked: movement type/vehicle"
-	elseif cmd:KeyDown(IN_ATTACK) or cmd:KeyDown(IN_USE) then
-		antiAimStatus.stage = "blocked: attack/use buttons=" .. cmd:GetButtons()
-	else
+	-- Anti-aim is the base layer; the aimbot overrides it afterwards only on
+	-- ticks where AA steps aside (attack/use held). IN_ATTACK2 must never block it.
+	if antiAimEnabled()
+		and IsValid(ply) and ply:Alive()
+		and ply:GetMoveType() == MOVETYPE_WALK and not ply:InVehicle()
+		and not cmd:KeyDown(IN_ATTACK) and not cmd:KeyDown(IN_USE) then
 		violentAntiAim(cmd, silentView)
 		antiAimMicro(cmd, ply)
 		aaApplied = true
-		antiAimStatus.stage = "applied"
 	end
 
 	-- A failing aimbot must never take the anti-aim down with it.
-	antiAimStatus.stage = antiAimStatus.stage .. "/aimbot"
 	if config.GetBool("violent_aimbot") then
 		local ok, err = pcall(violent_aimbot, cmd)
 		if not ok and not aaErrorNotified then
@@ -1069,9 +1037,9 @@ hook.Add("CreateMove", "violent.aimbot", function(cmd)
 
 	-- Re-assert our angle after every other CreateMove hook had its say.
 	local finalAngles = cmd:GetViewAngles()
-	if aaApplied or silentView or finalAngles.y ~= baseYaw then
+	if aaApplied or silent or finalAngles.y ~= baseYaw then
 		aaEnforce = Angle(finalAngles.p, finalAngles.y, finalAngles.r)
-		antiAimStatus.expected = aaEnforce
+		aaEnforceCommand = cmd:CommandNumber()
 	end
 
 	-- One movement fix for the whole pipeline, based on the camera yaw.
