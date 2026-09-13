@@ -223,6 +223,7 @@ local stopAnimations
 
 local function unload()
 	if stopAnimations then stopAnimations() end
+	if ded and ded.SetBSendPacket then ded.SetBSendPacket(true) end
 	hook.Remove("PreFrameStageNotify", "violent.animations.sync")
 	hook.Remove("PostFrameStageNotify", "violent.animations.update")
 	hook.Remove("ShouldUpdateAnimation", "violent.animations.filter")
@@ -331,7 +332,6 @@ local function initializeConfig()
 	if configInitialized then return end
 	configInitialized = true
 
-	-- zxcmodule installs netchannel hooks, so load it only after joining a map.
 	if not ded then
 		local ok, err = pcall(require, "zxcmodule")
 		if not ok then
@@ -389,6 +389,7 @@ config.Add("violent_strafer", 0, "Rage air strafer", 0, 1)
 
 config.Add("violent_antiaim", "backward", "At-targets anti-aim: backward, sideways or off")
 config.Add("violent_pitch", "zero", "Anti-aim pitch: down, zero or up")
+config.Add("violent_onshot_aa", 1, "Shots are sent immediately while choked commands keep anti-aim", 0, 1)
 config.Add("violent_min_fakelag", 0, "Minimum fakelag ticks", 0, 23)
 config.Add("violent_max_fakelag", 0, "Maximum fakelag ticks", 0, 23)
 
@@ -397,54 +398,43 @@ local function antiAimEnabled()
 	return mode == "backward" or mode == "sideways"
 end
 
-local function violentAntiAim(cmd, view)
-	-- Fall back to the incoming command angle; never index a nil view.
-	view = view or cmd:GetViewAngles()
-	local direction = string.lower(config.Get("violent_antiaim") or "backward")
-	local pitch = string.lower(config.Get("violent_pitch") or "zero")
-	-- Never modify the stored camera angle; it is also the no-target fallback.
-	local angles = Angle(view.p, view.y, 0)
-	local ply = LocalPlayer()
+local function nearestPlayer(ply)
+	local origin = ply:GetPos()
 	local nearest, nearestDistance = nil, math.huge
-
-	if IsValid(ply) then
-		local origin = ply:GetPos()
-		for _, target in ipairs(player.GetAll()) do
-			if target ~= ply and IsValid(target) and target:Alive() and not target:IsDormant() then
-				local distance = origin:DistToSqr(target:GetPos())
-				if distance < nearestDistance then
-					nearest, nearestDistance = target, distance
-				end
+	for _, target in ipairs(player.GetAll()) do
+		if target ~= ply and IsValid(target) and target:Alive() and not target:IsDormant() then
+			local distance = origin:DistToSqr(target:GetPos())
+			if distance < nearestDistance then
+				nearest, nearestDistance = target, distance
 			end
 		end
 	end
+	return nearest
+end
 
-	if IsValid(nearest) then
+local function violentAntiAim(cmd, ply, view)
+	local direction = string.lower(config.Get("violent_antiaim") or "backward")
+	local pitch = string.lower(config.Get("violent_pitch") or "zero")
+	local yaw = view.y
+
+	local nearest = nearestPlayer(ply)
+	if nearest then
 		local delta = nearest:EyePos() - ply:EyePos()
-		if delta:Length2DSqr() > 0.0001 then angles.y = delta:Angle().y end
+		if delta:Length2DSqr() > 0.0001 then yaw = delta:Angle().y end
 	end
 
 	if direction == "sideways" then
-		angles.y = angles.y + (cmd:CommandNumber() % 2 == 0 and 90 or -90)
+		yaw = yaw + (cmd:CommandNumber() % 2 == 0 and 90 or -90)
 	else
-		angles.y = angles.y + 180
+		yaw = yaw + 180
 	end
 
-	if pitch == "down" then
-		angles.p = 89
-	elseif pitch == "up" then
-		angles.p = -89
-	else
-		angles.p = 0
-	end
-
-	angles:Normalize()
-	cmd:SetViewAngles(angles)
+	local p = pitch == "down" and 89 or pitch == "up" and -89 or 0
+	cmd:SetViewAngles(Angle(p, math.NormalizeAngle(yaw), 0))
 end
 
 local aaMicroSide = false
 
--- Idle nudge so the lower body keeps updating while anti-aim holds (rapehack micromovement).
 local function antiAimMicro(cmd, ply)
 	if bit.band(ply:GetFlags(), FL_ONGROUND) == 0 then return end
 	if cmd:GetForwardMove() ~= 0 or cmd:GetSideMove() ~= 0 or cmd:GetUpMove() ~= 0 then return end
@@ -453,20 +443,24 @@ local function antiAimMicro(cmd, ply)
 	cmd:SetSideMove(aaMicroSide and 15 or -15)
 end
 
-local function violentFakelag(cmd)
+local lagChoked, lagLimit = 0, 0
+
+local function violentFakelag(cmd, forceSend)
 	if not ded or not ded.SetBSendPacket then return end
+
 	local minTicks = math.Clamp(math.floor(config.GetNumber("violent_min_fakelag")), 0, 23)
 	local maxTicks = math.Clamp(math.floor(config.GetNumber("violent_max_fakelag")), 0, 23)
 	if maxTicks < minTicks then minTicks, maxTicks = maxTicks, minTicks end
-	if maxTicks <= 0 then
+
+	if forceSend or maxTicks <= 0 or lagChoked >= lagLimit then
+		lagChoked = 0
+		lagLimit = minTicks + cmd:CommandNumber() * 7919 % (maxTicks - minTicks + 1)
 		ded.SetBSendPacket(true)
 		return
 	end
 
-	local span = maxTicks - minTicks + 1
-	local choke = minTicks + (cmd:CommandNumber() % span)
-	local tick = cmd:CommandNumber() % (maxTicks + 1)
-	ded.SetBSendPacket(tick >= choke)
+	lagChoked = lagChoked + 1
+	ded.SetBSendPacket(false)
 end
 
 function violent_strafer(cmd)
@@ -506,7 +500,6 @@ config.Add("violent_aimbot_nospread", 0, "Compensate spread on aimed primary sho
 config.Add("violent_aimbot_norecoil", 0, "Compensate view punch on aimed primary shots", 0, 1)
 local animationCvar = config.Add("violent_aimbot_animations", 1, "Update target animations from simulation time", 0, 1)
 
--- Keep samples per weapon entity: another player's shots must not replace our cone.
 local weaponCones = setmetatable({}, { __mode = "k" })
 
 hook.Add("EntityFireBullets", "violent.spread", function(ent, data)
@@ -516,7 +509,6 @@ hook.Add("EntityFireBullets", "violent.spread", function(ent, data)
 	if not IsValid(wep) or (ent ~= ply and ent ~= wep) then return end
 	if not isvector(data.Spread) then return end
 
-	-- Zero is a valid update (e.g. aiming down sights); never keep an old nonzero cone.
 	weaponCones[wep] = Vector(data.Spread.x, data.Spread.y, data.Spread.z)
 end)
 
@@ -530,18 +522,15 @@ local function aimNoSpread(cmd, ang, ply, wep)
 		if type(cone) ~= "number" then return ang end
 		if base == "swb" and ply:Crouching() then cone = cone * 0.85 end
 
-		-- These bases seed Lua's RNG from the command number before firing.
 		math.randomseed(cmd:CommandNumber())
 		return ang - Angle(math.Rand(-cone, cone), math.Rand(-cone, cone), 0) * 25
 	end
 
-	-- The donor has no TFA implementation; FAS2's time seed is not reliably shared.
 	if base == "tfa" or base == "fas2" then return ang end
 
 	local spread = weaponCones[wep]
 	if not spread or not ded or not ded.PredictSpread then return ang end
 
-	-- This module takes (UserCmd, Vector), NOT (UserCmd, Angle, Vector).
 	local correction = ded.PredictSpread(cmd, -spread)
 	local corrected = ang + correction:Angle()
 	corrected:Normalize()
@@ -550,7 +539,6 @@ end
 
 local function aimNoRecoil(ang, ply, wep)
 	local class = wep:GetClass()
-	-- These weapons do not add view punch to their bullet direction in the donor.
 	if class == "weapon_pistol" or string.StartsWith(class, "m9k_")
 		or string.StartsWith(class, "bb_") or string.StartsWith(class, "unclen8_") then
 		return ang
@@ -750,109 +738,84 @@ local function aimHeadPos(ent)
 	return readHeadPos(ent)
 end
 
-local aimTrace = {
-	mask = MASK_SHOT,
-}
+local aimTrace = { mask = MASK_SHOT }
+local aimHull = { mask = MASK_PLAYERSOLID, collisiongroup = COLLISION_GROUP_PLAYER_MOVEMENT }
+local hullLift = Vector(0, 0, 0.03125)
+local groundProbe = Vector(0, 0, 2)
+local gravityCvar = GetConVar("sv_gravity")
 
-local function aimExtrapolate(target, head, leadTime)
-	if leadTime <= 0 or target:GetMoveType() ~= MOVETYPE_WALK or target:InVehicle() then
-		return head
+local function aimLeadTime(cmd, target, velocity, tick)
+	local lead = math.Clamp(config.GetNumber("violent_aimbot_extrapolation_ticks"), 0, 8) * tick
+	if not ded or not ded.GetSimulationTime then return lead end
+
+	local age = cmd:TickCount() * tick - ded.GetSimulationTime(target)
+	if age > tick * 2 and velocity:Length2DSqr() * age * age > 4096 then
+		lead = lead + math.min(age, 0.25)
 	end
+	return lead
+end
 
-	local velocity = target:GetVelocity()
-	velocity = Vector(velocity.x, velocity.y, velocity.z)
-	-- A player spinning against a wall can report large velocity while its origin
-	-- barely changes. Do not extrapolate that stale movement into the next shot.
-	local previousPos = target:GetPos()
-	if velocity:Length2DSqr() > 250000 then
-		local probe = util.TraceHull({
-			start = previousPos,
-			endpos = previousPos + velocity * math.min(leadTime, engine.TickInterval()),
-			mins = target:GetCollisionBounds(),
-			maxs = select(2, target:GetCollisionBounds()),
-			filter = target,
-			mask = MASK_PLAYERSOLID,
-			collisiongroup = COLLISION_GROUP_PLAYER_MOVEMENT,
-		})
-		if probe.StartSolid or probe.AllSolid or probe.Fraction < 0.05 then
-			velocity = Vector(0, 0, velocity.z)
-		end
-	end
-	local grounded = target:OnGround() and velocity.z <= 0
-	if grounded and velocity:LengthSqr() == 0 then return head end
+local function aimExtrapolate(cmd, target, head)
+	if target:GetMoveType() ~= MOVETYPE_WALK or target:InVehicle() then return head end
 
-	local gravityCvar = GetConVar("sv_gravity")
-	local gravityScale = target:GetGravity()
-	if gravityScale == 0 then gravityScale = 1 end
-	local gravity = (gravityCvar and gravityCvar:GetFloat() or 600) * gravityScale
-	if target:WaterLevel() >= 2 then gravity = 0 end
-
-	-- A small lift avoids treating contact with the floor as an embedded hull.
-	local start = target:GetPos() + Vector(0, 0, 0.03125)
-	local pos = start
-	local mins, maxs = target:GetCollisionBounds()
-	local hull = {
-		mins = mins, maxs = maxs,
-		filter = target,
-		mask = MASK_PLAYERSOLID,
-		collisiongroup = COLLISION_GROUP_PLAYER_MOVEMENT,
-	}
 	local tick = engine.TickInterval()
-	local timeLeft = leadTime
+	local velocity = target:GetVelocity()
+	local timeLeft = aimLeadTime(cmd, target, velocity, tick)
+	local grounded = target:OnGround() and velocity.z <= 0
+	if timeLeft <= 0 or grounded and velocity:LengthSqr() == 0 then return head end
+
+	local gravity = 0
+	if target:WaterLevel() < 2 then
+		local scale = target:GetGravity()
+		gravity = (gravityCvar and gravityCvar:GetFloat() or 600) * (scale == 0 and 1 or scale)
+	end
+
+	local start = target:GetPos() + hullLift
+	local pos = start
+	aimHull.mins, aimHull.maxs = target:GetCollisionBounds()
+	aimHull.filter = target
 
 	while timeLeft > 0 do
 		local dt = math.min(tick, timeLeft)
-		timeLeft = math.max(0, timeLeft - dt)
-
-		if grounded then
-			velocity.z = 0
-		else
-			velocity.z = velocity.z - gravity * dt * 0.5
-		end
+		timeLeft = timeLeft - dt
+		velocity.z = grounded and 0 or velocity.z - gravity * dt * 0.5
 
 		local moveTime = dt
-		for bump = 1, 4 do
-			hull.start = pos
-			hull.endpos = pos + velocity * moveTime
-			local trace = util.TraceHull(hull)
+		for _ = 1, 4 do
+			aimHull.start = pos
+			aimHull.endpos = pos + velocity * moveTime
+			local trace = util.TraceHull(aimHull)
 			if trace.StartSolid or trace.AllSolid then return end
 			pos = trace.HitPos
 			if not trace.Hit then break end
 
 			moveTime = moveTime * (1 - trace.Fraction)
 			local into = velocity:Dot(trace.HitNormal)
-			if into < 0 then
-				velocity = velocity - trace.HitNormal * into
-			end
+			if into < 0 then velocity = velocity - trace.HitNormal * into end
 			pos = pos + trace.HitNormal * 0.03125
 			if moveTime <= 0 or velocity:LengthSqr() < 0.0001 then break end
 		end
 
-		-- Recheck support every step: walking off a ledge must start a fall.
-		hull.start = pos
-		hull.endpos = pos - Vector(0, 0, 2)
-		local ground = util.TraceHull(hull)
-		grounded = velocity.z <= 0 and ground.Hit and not ground.StartSolid
-			and not ground.AllSolid and ground.HitNormal.z >= 0.7
+		aimHull.start = pos
+		aimHull.endpos = pos - groundProbe
+		local ground = util.TraceHull(aimHull)
+		grounded = velocity.z <= 0 and ground.Hit and not ground.StartSolid and not ground.AllSolid and ground.HitNormal.z >= 0.7
 		if grounded then
-			pos = ground.HitPos + Vector(0, 0, 0.03125)
+			pos = ground.HitPos + hullLift
 			velocity.z = 0
 		else
 			velocity.z = velocity.z - gravity * dt * 0.5
 		end
 	end
 
-	-- Translate the existing head pose; never modify the entity or its network origin.
 	return head + (pos - start)
 end
 
-local function aimPoint(target, ply, eyePos, leadTime)
+local function aimPoint(cmd, target, ply, eyePos)
 	local head = aimHeadPos(target)
-	local predicted = aimExtrapolate(target, head, leadTime)
+	local predicted = aimExtrapolate(cmd, target, head)
 	if not predicted then return end
 
-	-- Check the future sightline, not the current one (which rejects emerging targets).
-	-- First keep the target in the trace so an unchanged head behind its body is rejected.
 	aimTrace.start = eyePos
 	aimTrace.endpos = predicted
 	aimTrace.filter = ply
@@ -863,7 +826,6 @@ local function aimPoint(target, ply, eyePos, leadTime)
 	if predicted:DistToSqr(head) < 0.0001 then
 		if trace.Hit and trace.HitGroup ~= HEADGROUP then return end
 	else
-		-- The old target hull must not hide an obstacle on the rest of the future ray.
 		aimTrace.filter = { ply, target }
 		trace = util.TraceLine(aimTrace)
 		if trace.Hit or trace.StartSolid or trace.AllSolid then return end
@@ -872,53 +834,24 @@ local function aimPoint(target, ply, eyePos, leadTime)
 	return predicted
 end
 
-local cachedAutoWep, cachedAuto = nil, false
-
-local function isAutomaticWep(wep)
-	if wep == cachedAutoWep then return cachedAuto end
-
-	local automatic = false
-	local ok, prim = pcall(function() return wep.Primary end)
-	if ok and type(prim) == "table" and prim.Automatic then
-		automatic = true
-	end
-
-	cachedAutoWep, cachedAuto = wep, automatic
-	return automatic
+local function canFire(ply)
+	local wep = ply:GetActiveWeapon()
+	return IsValid(wep) and wep:Clip1() ~= 0 and wep:GetNextPrimaryFire() <= CurTime()
 end
 
-local function aimAutoFire(cmd, ply)
-	local wep = ply:GetActiveWeapon()
-	if not IsValid(wep) then return end
-
+local function setAttack(cmd, down)
 	local buttons = cmd:GetButtons()
-
-	if isAutomaticWep(wep) then
-		cmd:SetButtons(bit.bor(buttons, IN_ATTACK))
-		return
-	end
-
-	if cmd:CommandNumber() % 3 == 0 then
-		cmd:SetButtons(bit.band(buttons, bit.bnot(IN_ATTACK)))
-	else
-		cmd:SetButtons(bit.bor(buttons, IN_ATTACK))
-	end
+	cmd:SetButtons(down and bit.bor(buttons, IN_ATTACK) or bit.band(buttons, bit.bnot(IN_ATTACK)))
 end
 
 local silentView = nil
 local silentOrigin = nil
 local aaErrorNotified = false
-
--- Angle to re-assert in PostCreateMove and the command it belongs to.
 local aaEnforce, aaEnforceCommand = nil, -1
 
 local mYawCvar = GetConVar("m_yaw")
 local mPitchCvar = GetConVar("m_pitch")
 
--- Runs after every Lua CreateMove hook (weapon bases, gamemodes) and right
--- before zxcmodule rewrites the verified command CRC. Anything that overwrote
--- our angles during the tick gets overwritten back here, so the anti-aim /
--- silent angle is what actually reaches the server. No-op without the module.
 hook.Add("PostCreateMove", "violent.antiaim.enforce", function(cmd)
 	if not aaEnforce or cmd:CommandNumber() ~= aaEnforceCommand then return end
 	local angles = cmd:GetViewAngles()
@@ -928,56 +861,41 @@ hook.Add("PostCreateMove", "violent.antiaim.enforce", function(cmd)
 	aaEnforce = nil
 end)
 
--- Accumulates raw mouse deltas into the camera angle. Must run for every
--- CreateMove call, including the per-frame CommandNumber() == 0 samples:
--- the engine consumes mouse deltas on those too, so skipping them drops
--- input and makes the camera stutter at tick rate.
---
--- Only the accumulator runs on the 0 command. Its view angles must stay
--- untouched: the engine copies them into its own view angles every frame,
--- and the local player's eye angles / animstate read from there. Writing the
--- camera angle into it hides the anti-aim on the local model. The camera is
--- decoupled in CalcView instead.
 local function silentUpdate(cmd)
 	silentView.p = math.Clamp(silentView.p + cmd:GetMouseY() * mPitchCvar:GetFloat(), -89, 89)
 	silentView.y = math.NormalizeAngle(silentView.y - cmd:GetMouseX() * mYawCvar:GetFloat())
 	silentView.r = 0
 end
 
-function violent_aimbot(cmd)
-	local ply = LocalPlayer()
-	if not IsValid(ply) or not ply:Alive() then return end
-	if ply:GetMoveType() ~= MOVETYPE_WALK then return end
-	if not aimBindDown() then return end
+function violent_aimbot(cmd, ply, view, attackHeld, onShot)
+	if not aimBindDown() then return false end
 
 	local eyePos = ply:EyePos()
-	local forward = cmd:GetViewAngles():Forward()
-	local leadTime = math.Clamp(config.GetNumber("violent_aimbot_extrapolation_ticks"), 0, 8) * engine.TickInterval()
-
+	local forward = view:Forward()
 	local bestDir, bestDot = nil, -2
 
 	for _, target in ipairs(player.GetAll()) do
-		if target == ply or not IsValid(target) or not target:Alive() or target:IsDormant() then continue end
-
-		local head = aimPoint(target, ply, eyePos, leadTime)
-		if not head then continue end
-
-		local dir = head - eyePos
-		local dot = forward:Dot(dir:GetNormalized())
-		if dot > bestDot then
-			bestDot, bestDir = dot, dir
+		if target ~= ply and IsValid(target) and target:Alive() and not target:IsDormant() then
+			local head = aimPoint(cmd, target, ply, eyePos)
+			if head then
+				local dir = head - eyePos
+				local dot = forward:Dot(dir:GetNormalized())
+				if dot > bestDot then bestDot, bestDir = dot, dir end
+			end
 		end
 	end
 
-	if not bestDir then return end
+	if not bestDir then return false end
 
-	if config.GetBool("violent_aimbot_autofire") and cmd:CommandNumber() ~= 0 then
-		aimAutoFire(cmd, ply)
-	end
+	local autofire = config.GetBool("violent_aimbot_autofire")
+	local firing = (autofire or attackHeld) and canFire(ply)
+	if onShot and not firing then return false end
+	if autofire and firing then setAttack(cmd, true) end
 
-	local bestAngle = bestDir:Angle()
-	bestAngle.r = 0
-	cmd:SetViewAngles(aimCompensate(cmd, bestAngle, ply))
+	local angles = bestDir:Angle()
+	angles.r = 0
+	cmd:SetViewAngles(aimCompensate(cmd, angles, ply))
+	return firing
 end
 
 function violent_movement_fix(cmd, wish_yaw)
@@ -1010,50 +928,50 @@ hook.Add("CreateMove", "violent.aimbot", function(cmd)
 
 	if not realCommand then return end
 
-	-- Real commands start from the camera angle; anti-aim / aimbot layer on top of it.
+	local view = cmd:GetViewAngles()
 	if silentView then
-		cmd:SetViewAngles(Angle(silentView.p, silentView.y, 0))
+		view = Angle(silentView.p, silentView.y, 0)
+		cmd:SetViewAngles(view)
 	end
 
-	-- Keep strafing before aiming so the silent movement fix is applied last.
 	movement(cmd)
-	violentFakelag(cmd)
 
-	-- Camera-relative yaw before the angle pipeline touches the command.
-	local baseYaw = cmd:GetViewAngles().y
 	local ply = LocalPlayer()
-	local aaApplied = false
+	local active = IsValid(ply) and ply:Alive() and ply:GetMoveType() == MOVETYPE_WALK and not ply:InVehicle()
+	local antiAim = active and antiAimEnabled()
+	local onShot = antiAim and config.GetBool("violent_onshot_aa")
+	local attackHeld = cmd:KeyDown(IN_ATTACK)
+	local shot = onShot and attackHeld and canFire(ply)
 
-	-- Anti-aim is the base layer; the aimbot overrides it afterwards only on
-	-- ticks where AA steps aside (attack/use held). IN_ATTACK2 must never block it.
-	if antiAimEnabled()
-		and IsValid(ply) and ply:Alive()
-		and ply:GetMoveType() == MOVETYPE_WALK and not ply:InVehicle()
-		and not cmd:KeyDown(IN_ATTACK) and not cmd:KeyDown(IN_USE) then
-		violentAntiAim(cmd, silentView)
+	if onShot and attackHeld and not shot then setAttack(cmd, false) end
+
+	local yielding = cmd:KeyDown(IN_USE) or (onShot and shot) or (not onShot and attackHeld)
+	local aaApplied = antiAim and not yielding
+	if aaApplied then
+		violentAntiAim(cmd, ply, view)
 		antiAimMicro(cmd, ply)
-		aaApplied = true
 	end
 
-	-- A failing aimbot must never take the anti-aim down with it.
-	if config.GetBool("violent_aimbot") then
-		local ok, err = pcall(violent_aimbot, cmd)
-		if not ok and not aaErrorNotified then
+	if active and config.GetBool("violent_aimbot") then
+		local ok, result = pcall(violent_aimbot, cmd, ply, view, attackHeld, onShot)
+		if ok then
+			shot = shot or result
+		elseif not aaErrorNotified then
 			aaErrorNotified = true
-			notify("aimbot error: %s", tostring(err))
+			notify("aimbot error: %s", tostring(result))
 		end
 	end
 
-	-- Re-assert our angle after every other CreateMove hook had its say.
+	violentFakelag(cmd, onShot and shot)
+
 	local finalAngles = cmd:GetViewAngles()
-	if aaApplied or silent or finalAngles.y ~= baseYaw then
+	if aaApplied or silent or finalAngles.y ~= view.y then
 		aaEnforce = Angle(finalAngles.p, finalAngles.y, finalAngles.r)
 		aaEnforceCommand = cmd:CommandNumber()
 	end
 
-	-- One movement fix for the whole pipeline, based on the camera yaw.
-	if finalAngles.y ~= baseYaw or finalAngles.p ~= 0 then
-		violent_movement_fix(cmd, baseYaw)
+	if finalAngles.y ~= view.y or math.abs(finalAngles.p) > 89 then
+		violent_movement_fix(cmd, view.y)
 	end
 end)
 
@@ -1172,7 +1090,6 @@ hook.Add("HUDPaint", "violent.esp", function()
 	end
 end)
 
--- Register every setting before loading, including when executed on an active map.
 hook.Add("InitPostEntity", "violent.config.autoload", initializeConfig)
 if IsValid(LocalPlayer()) then
 	initializeConfig()
