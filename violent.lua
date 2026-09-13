@@ -932,6 +932,12 @@ end)
 -- CreateMove call, including the per-frame CommandNumber() == 0 samples:
 -- the engine consumes mouse deltas on those too, so skipping them drops
 -- input and makes the camera stutter at tick rate.
+--
+-- Only the accumulator runs on the 0 command. Its view angles must stay
+-- untouched: the engine copies them into its own view angles every frame,
+-- and the local player's eye angles / animstate read from there. Writing the
+-- camera angle into it hides the anti-aim on the local model. The camera is
+-- decoupled in CalcView instead.
 local function silentUpdate(cmd)
 	silentView.p = math.Clamp(silentView.p + cmd:GetMouseY() * mPitchCvar:GetFloat(), -89, 89)
 	silentView.y = math.NormalizeAngle(silentView.y - cmd:GetMouseX() * mYawCvar:GetFloat())
@@ -991,20 +997,23 @@ hook.Add("CreateMove", "violent.aimbot", function(cmd)
 	syncAnimations()
 
 	local silent = config.GetBool("violent_aimbot_silent") or antiAimEnabled()
+	local realCommand = cmd:CommandNumber() ~= 0
 
-	-- Camera update happens before the CommandNumber() == 0 early-out on purpose (see silentUpdate).
-	if silent then
-		if not silentView then
-			local init = cmd:GetViewAngles()
-			silentView = Angle(init.p, init.y, 0)
-		end
-		silentUpdate(cmd)
-		cmd:SetViewAngles(Angle(silentView.p, silentView.y, 0))
-	else
+	if not silent then
 		silentView, silentOrigin = nil, nil
+	elseif silentView then
+		silentUpdate(cmd)
+	elseif realCommand then
+		local init = cmd:GetViewAngles()
+		silentView = Angle(init.p, init.y, 0)
 	end
 
-	if cmd:CommandNumber() == 0 then return end
+	if not realCommand then return end
+
+	-- Real commands start from the camera angle; anti-aim / aimbot layer on top of it.
+	if silentView then
+		cmd:SetViewAngles(Angle(silentView.p, silentView.y, 0))
+	end
 
 	-- Keep strafing before aiming so the silent movement fix is applied last.
 	movement(cmd)
