@@ -1,0 +1,49 @@
+
+#pragma once
+
+class INetChannelInfo;
+class INetChannel;
+class IGMODDataTable;
+
+enum ClientFrameStage_t
+{
+	FRAME_UNDEFINED = -1,						// (haven't run any frames yet)
+	FRAME_START = 0,
+	FRAME_NET_UPDATE_START = 1,					// A network packet is being recieved
+	FRAME_NET_UPDATE_POSTDATAUPDATE_START = 2,	// Data has been received and we're going to start calling PostDataUpdate 
+	FRAME_NET_UPDATE_POSTDATAUPDATE_END = 3,	// Data has been received and we've called PostDataUpdate on all data recipients
+	FRAME_NET_UPDATE_END = 4,					// We've received all packets, we can now do interpolation, prediction, etc..
+	FRAME_RENDER_START = 5,						// We're about to start rendering the scene
+	FRAME_RENDER_END = 6 						// We've finished rendering the scene.
+};
+
+#include "vmt.h"
+#include "util.h"
+
+#include "angle.h"
+
+class IEngineClient {
+public:
+	VPROXY(ServerCmd, 6, void, (char const* szCmdString, bool bReliable), szCmdString, bReliable);
+	VPROXY(ClientCmd, 7, void, (char const* szCmdString), szCmdString);
+	VPROXY(GetLocalPlayer, 12, int, (void));
+	VPROXY(Time, 14, double, (void));
+	VPROXY(GetLastTimeStamp, 15, double, (void));
+	VPROXY(GetViewAngles, 19, void, (Angle* va), va);
+	VPROXY(SetViewAngles, 20, void, (Angle* va), va);
+	VPROXY(IsBoxVisible, 31, bool, (Vector const& mins, Vector const& maxs), mins, maxs);
+	VPROXY(IsBoxInViewCluster, 32, bool, (Vector const& mins, Vector const& maxs), mins, maxs);
+	VPROXY(GetGameDirectory, 35, char const*, (void));
+	VPROXY(IsOccluded, 69, bool, (Vector const& vecAbsMins, Vector const& vecAbsMaxs), vecAbsMins, vecAbsMaxs);
+	VPROXY(GetNetChannelInfo, 72, INetChannelInfo*, (void));
+	VPROXY(IsPlayingTimeDemo, 78, bool, (void));
+	VPROXY(ExecuteClientCmd, 102, void, (char const* szCmdString), szCmdString);
+	VPROXY(ClientCmd_Unrestricted, 106, void, (char const* szCmdString), szCmdString);
+	VPROXY(SetRestrictServerCommands, 107, void, (bool bRestrict), bRestrict);
+	VPROXY(SetRestrictClientCommands, 108, void, (bool bRestrict), bRestrict);
+	VPROXY(GMOD_RawClientCmd_Unrestricted, 139, void, (char const* szCmdString), szCmdString);
+	VPROXY(GMOD_DestroyDataTable, 141, void, (IGMODDataTable* dataTable), dataTable);
+	 
+	INetChannel* GetNetChannel() { return reinterpret_cast<INetChannel*>(GetNetChannelInfo()); }
+}; 
+ 
